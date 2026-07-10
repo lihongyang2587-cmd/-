@@ -255,6 +255,7 @@ static void *alarm_timer_thread(void *arg)
     printf("[ALARM] 目标 epoch: %ld, 当前 epoch: %ld, 差值: %ld 秒\n",
            (long)target_time, (long)now, diff_sec);
 
+    /* 防御性检查：正常情况下 cmd 层已拦截过期时间，此处作为最后防线 */
     if (diff_sec <= 0) {
         fprintf(stderr, "[ALARM] 警告: 目标时间已是过去 (差 %ld 秒)，"
                 "将立即执行\n", diff_sec);
@@ -425,6 +426,31 @@ int device_alarm_execute(const cmd_t *cmd, cJSON **resp)
                 if (resp) *resp = msg_build_response(ERR_PARAM_INVALID,
                                                      "openType=1 时 openData 不能为空");
                 return -1;
+            }
+            /* 严格校验：定时时间不能为过去 */
+            {
+                struct tm target_tm;
+                if (parse_datetime(open_data, &target_tm) != 0) {
+                    if (resp) *resp = msg_build_response(ERR_PARAM_INVALID,
+                                                         "openData 时间格式无效");
+                    return -1;
+                }
+                time_t target_time = mktime(&target_tm);
+                if (target_time == (time_t)-1) {
+                    if (resp) *resp = msg_build_response(ERR_PARAM_INVALID,
+                                                         "openData 时间转换失败");
+                    return -1;
+                }
+                time_t now;
+                time(&now);
+                if (difftime(target_time, now) <= 0) {
+                    fprintf(stderr, "[ALARM] 定时时间已是过去: %s"
+                            " (当前: %ld, 目标: %ld)\n",
+                            open_data, (long)now, (long)target_time);
+                    if (resp) *resp = msg_build_response(ERR_PARAM_INVALID,
+                                                         "定时时间不能为过去的时间");
+                    return -1;
+                }
             }
             printf("[ALARM] 定时开启，模式: %d, 时间: %s\n",
                    light_type, open_data);

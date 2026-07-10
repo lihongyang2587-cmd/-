@@ -368,32 +368,67 @@ static int play_file_blocking(const char *filepath)
 }
 
 /**
+ * @brief   解析 "YYYY-MM-DD HH:mm:ss" 时间字符串，校验各字段范围
+ * @return  0 成功，-1 失败
+ */
+static int parse_datetime(const char *str, struct tm *out_tm)
+{
+    if (!str || !out_tm) return -1;
+
+    int year = 0, month = 0, day = 0, hour = 0, min = 0, sec = 0;
+
+    if (sscanf(str, "%d-%d-%d %d:%d:%d",
+               &year, &month, &day, &hour, &min, &sec) != 6) {
+        fprintf(stderr, "[SPK] 时间格式解析失败（字段不足 6 个）: %s\n", str);
+        return -1;
+    }
+
+    if (year  < 1970 || year  > 2099) return -1;
+    if (month < 1    || month > 12)   return -1;
+    if (day   < 1    || day   > 31)   return -1;
+    if (hour  < 0    || hour  > 23)   return -1;
+    if (min   < 0    || min   > 59)   return -1;
+    if (sec   < 0    || sec   > 59)   return -1;
+
+    memset(out_tm, 0, sizeof(struct tm));
+    out_tm->tm_year  = year  - 1900;
+    out_tm->tm_mon   = month - 1;
+    out_tm->tm_mday  = day;
+    out_tm->tm_hour  = hour;
+    out_tm->tm_min   = min;
+    out_tm->tm_sec   = sec;
+    out_tm->tm_isdst = -1;
+
+    return 0;
+}
+
+/**
  * @brief   等待到指定时间（同 alarm 模块定时逻辑）
  * @return  0 到达目标时间，-1 解析失败
  */
 static int wait_until_time(const char *time_str)
 {
-    int y = 0, m = 0, d = 0, h = 0, mi = 0, s = 0;
-    if (sscanf(time_str, "%d-%d-%d %d:%d:%d",
-               &y, &m, &d, &h, &mi, &s) != 6) {
+    struct tm target;
+    if (parse_datetime(time_str, &target) != 0) {
         fprintf(stderr, "[SPK] 定时时间解析失败: %s\n", time_str);
         return -1;
     }
-
-    struct tm target;
-    memset(&target, 0, sizeof(target));
-    target.tm_year  = y - 1900;
-    target.tm_mon   = m - 1;
-    target.tm_mday  = d;
-    target.tm_hour  = h;
-    target.tm_min   = mi;
-    target.tm_sec   = s;
-    target.tm_isdst = -1;
 
     time_t target_time = mktime(&target);
     if (target_time == (time_t)-1) {
         fprintf(stderr, "[SPK] mktime 转换失败\n");
         return -1;
+    }
+
+    /* 防御性检查：正常情况下 cmd 层已拦截过期时间，此处作为最后防线 */
+    {
+        time_t now;
+        time(&now);
+        long diff_sec = (long)difftime(target_time, now);
+        if (diff_sec <= 0) {
+            fprintf(stderr, "[SPK] 警告: 目标时间已是过去 (差 %ld 秒)，将立即执行\n",
+                    diff_sec);
+        }
     }
 
     while (!g_stop_flag) {
@@ -751,6 +786,31 @@ int device_speaker_execute(const cmd_t *cmd, cJSON **resp)
                     if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
                                                          "audioIndex 无效");
                     return -1;
+                }
+                /* 严格校验：定时时间不能为过去 */
+                {
+                    struct tm target_tm;
+                    if (parse_datetime(req.timed_str, &target_tm) != 0) {
+                        if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
+                                                             "playData 时间格式无效");
+                        return -1;
+                    }
+                    time_t target_time = mktime(&target_tm);
+                    if (target_time == (time_t)-1) {
+                        if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
+                                                             "playData 时间转换失败");
+                        return -1;
+                    }
+                    time_t now;
+                    time(&now);
+                    if (difftime(target_time, now) <= 0) {
+                        fprintf(stderr, "[SPK] 定时时间已是过去: %s"
+                                " (当前: %ld, 目标: %ld)\n",
+                                req.timed_str, (long)now, (long)target_time);
+                        if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
+                                                             "定时时间不能为过去的时间");
+                        return -1;
+                    }
                 }
                 pthread_mutex_lock(&g_spk_mutex);
                 g_play_data = 1;  /* V2.7: 有定时数据 */
