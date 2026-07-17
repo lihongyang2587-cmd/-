@@ -26,6 +26,12 @@ extern "C" {
 /* ======================================================================== */
 
 cJSON *msg_build_heartbeat(long uptime_sec);
+/**
+ * @brief   构建设备状态推送消息（心跳上报用）
+ *
+ *          数据来源：配置管理器内存缓存（非硬件查询），
+ *          避免与 worker 线程竞争各设备互斥锁。
+ */
 cJSON *msg_build_device_status(void);
 cJSON *msg_build_alarm(const char *device_name, const char *message);
 cJSON *msg_build_error(int code, const char *message);
@@ -55,17 +61,24 @@ cJSON *msg_build_cmd_response(int code, int cmd, const char *msg);
 
 /**
  * @brief   系统状态采集响应 (cmd=601)
- *          { "cmd": 601, "result": 0 }
+ *
+ *          格式: { "cmd": 601, "result": 0, "token": "...",
+ *                  "ptz":{...}, "led":{...}, "speaker":{...}, "alarm":{...} }
+ *
+ *          数据来源：配置管理器内存缓存（非硬件查询），不阻塞主线程。
+ *          包含 ptz / led / speaker / alarm 四个设备的状态对象。
+ *
  * @param   result  0=成功，1=失败
+ * @param   token   鉴权令牌（可为 NULL）
  */
-cJSON *msg_build_sys_status_response(int result);
+cJSON *msg_build_sys_status_response(int result, const char *token);
 
 /**
  * @brief   系统版本查询响应 (cmd=603)
- *          { "cmd": 603, "mainVer": N }
- * @param   mainVer 当前主版本号
+ *          { "cmd": 603, "mainVer": "1.0.0" }
+ * @param   version  当前完整版本号（三段式，如 CTRL_BOARD_FW_VERSION）
  */
-cJSON *msg_build_sys_version_response(int mainVer);
+cJSON *msg_build_sys_version_response(const char *version);
 
 /**
  * @brief   音箱音频列表查询响应 (cmd=303)

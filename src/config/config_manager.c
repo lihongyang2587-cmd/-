@@ -17,11 +17,14 @@
 #include <pthread.h>
 
 #include "config.h"
+#include "msg_builder.h"
+#include "ws_send_queue.h"
 #include "device_ptz.h"
 #include "device_led.h"
 #include "device_speaker.h"
 #include "device_alarm.h"
 #include "device_mood.h"
+#include "device_system.h"       /* compare_versions() */
 #include "preset_config.h"
 
 /* ======================================================================== */
@@ -125,6 +128,91 @@ static void update_fail_status(cJSON *cache, int fail_status)
     cJSON_AddNumberToObject(cache, "failStatus", fail_status);
 }
 
+/**
+ * @brief   校验并钳位设备配置缓存中的越界字段
+ *
+ *          在 merge_status() 之后、save_atomic() 之前调用，
+ *          防止异常值（如 audioIndex=-1）被持久化到磁盘。
+ *          钳位边界与各设备 cmd handler 中的参数校验保持一致。
+ */
+static void validate_device_cache(int category, cJSON *cache)
+{
+    if (!cache) return;
+
+    switch (category) {
+    case CAT_PTZ: {
+        cJSON *j;
+        j = cJSON_GetObjectItem(cache, "horizontalAngle");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < PTZ_H_ANGLE_MIN) cJSON_SetNumberValue(j, PTZ_H_ANGLE_MIN);
+            if (j->valueint > PTZ_H_ANGLE_MAX) cJSON_SetNumberValue(j, PTZ_H_ANGLE_MAX);
+        }
+        j = cJSON_GetObjectItem(cache, "verticalAngle");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < PTZ_V_ANGLE_MIN) cJSON_SetNumberValue(j, PTZ_V_ANGLE_MIN);
+            if (j->valueint > PTZ_V_ANGLE_MAX) cJSON_SetNumberValue(j, PTZ_V_ANGLE_MAX);
+        }
+        j = cJSON_GetObjectItem(cache, "speed");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 0)  cJSON_SetNumberValue(j, 0);
+            if (j->valueint > 10) cJSON_SetNumberValue(j, 10);
+        }
+        break;
+    }
+    case CAT_SPEAKER: {
+        cJSON *j;
+        j = cJSON_GetObjectItem(cache, "audioIndex");
+        if (cJSON_IsNumber(j) && j->valueint < 0) cJSON_SetNumberValue(j, 0);
+        j = cJSON_GetObjectItem(cache, "volume");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 0)   cJSON_SetNumberValue(j, 0);
+            if (j->valueint > 100) cJSON_SetNumberValue(j, 100);
+        }
+        j = cJSON_GetObjectItem(cache, "playType");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 0) cJSON_SetNumberValue(j, 0);
+            if (j->valueint > 4) cJSON_SetNumberValue(j, 0);
+        }
+        break;
+    }
+    case CAT_LED: {
+        cJSON *j;
+        j = cJSON_GetObjectItem(cache, "lightVal");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 1)   cJSON_SetNumberValue(j, 1);
+            if (j->valueint > 100) cJSON_SetNumberValue(j, 100);
+        }
+        j = cJSON_GetObjectItem(cache, "showType");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 0) cJSON_SetNumberValue(j, 0);
+            if (j->valueint > 2) cJSON_SetNumberValue(j, 0);
+        }
+        j = cJSON_GetObjectItem(cache, "displayStyle");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 0) cJSON_SetNumberValue(j, 0);
+            if (j->valueint > 2) cJSON_SetNumberValue(j, 0);
+        }
+        break;
+    }
+    case CAT_ALARM: {
+        cJSON *j;
+        j = cJSON_GetObjectItem(cache, "state");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 0) cJSON_SetNumberValue(j, 0);
+            if (j->valueint > 1) cJSON_SetNumberValue(j, 0);
+        }
+        j = cJSON_GetObjectItem(cache, "lightType");
+        if (cJSON_IsNumber(j)) {
+            if (j->valueint < 0)  cJSON_SetNumberValue(j, 0);
+            if (j->valueint > 14) cJSON_SetNumberValue(j, 0);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 /* ======================================================================== */
 /*  默认值构建（config.h 宏作为兜底）                                           */
 /* ======================================================================== */
@@ -145,6 +233,7 @@ static cJSON *build_default_ptz(void)
     cJSON *j = cJSON_CreateObject();
     cJSON_AddBoolToObject  (j, "online",           true);
     cJSON_AddNumberToObject(j, "failStatus",       0);
+    cJSON_AddStringToObject(j, "state",            "idle");
     cJSON_AddNumberToObject(j, "horizontalAngle",   180);
     cJSON_AddNumberToObject(j, "verticalAngle",     0);
     cJSON_AddNumberToObject(j, "speed",             0);
@@ -289,6 +378,38 @@ int config_manager_init(const char *config_dir)
         }
     }
 
+    /*
+     * fwVersion 自动修正：
+     * 版本号的唯一权威来源是编译进固件的 CTRL_BOARD_FW_VERSION。
+     * system.json 中的 fwVersion 若与编译值不同则自动修正。
+     * 服务端下发的 mainVer 仅用于升级前的版本比对（compare_versions），
+     * 不参与 fwVersion 的确定。
+     */
+    if (g_cache[CAT_SYSTEM]) {
+        cJSON *fw = cJSON_GetObjectItem(g_cache[CAT_SYSTEM], "fwVersion");
+        const char *disk_ver = (cJSON_IsString(fw) && fw->valuestring)
+                                ? fw->valuestring : NULL;
+
+        if (disk_ver && disk_ver[0] != '\0') {
+            if (strcmp(disk_ver, CTRL_BOARD_FW_VERSION) != 0) {
+                /* 磁盘版本与编译版本不一致，以编译版本为准 */
+                cJSON_SetValuestring(fw, CTRL_BOARD_FW_VERSION);
+                save_atomic("system", g_cache[CAT_SYSTEM]);
+                printf("[CFG] fwVersion 自动修正: %s → %s\n",
+                       disk_ver, CTRL_BOARD_FW_VERSION);
+            }
+        } else {
+            /* fwVersion 缺失或为空：首次启动，用编译版本填充 */
+            if (cJSON_IsString(fw))
+                cJSON_SetValuestring(fw, CTRL_BOARD_FW_VERSION);
+            else
+                cJSON_AddStringToObject(g_cache[CAT_SYSTEM], "fwVersion",
+                                        CTRL_BOARD_FW_VERSION);
+            save_atomic("system", g_cache[CAT_SYSTEM]);
+            printf("[CFG] 首次启动: fwVersion = %s\n", CTRL_BOARD_FW_VERSION);
+        }
+    }
+
     g_inited = true;
     printf("[CFG] 配置管理器初始化完成 (%d 个类别)\n", CAT_COUNT);
     return 0;
@@ -381,6 +502,7 @@ void config_manager_sync_device_status(void)
     if (ptz) {
         merge_status(g_cache[CAT_PTZ], ptz);
         update_fail_status(g_cache[CAT_PTZ], device_ptz_get_fail_status());
+        validate_device_cache(CAT_PTZ, g_cache[CAT_PTZ]);
         save_atomic("ptz", g_cache[CAT_PTZ]);
         cJSON_Delete(ptz);
     }
@@ -390,6 +512,7 @@ void config_manager_sync_device_status(void)
     if (led) {
         merge_status(g_cache[CAT_LED], led);
         update_fail_status(g_cache[CAT_LED], device_led_get_fail_status());
+        validate_device_cache(CAT_LED, g_cache[CAT_LED]);
         save_atomic("led", g_cache[CAT_LED]);
         cJSON_Delete(led);
     }
@@ -399,6 +522,7 @@ void config_manager_sync_device_status(void)
     if (speaker) {
         merge_status(g_cache[CAT_SPEAKER], speaker);
         update_fail_status(g_cache[CAT_SPEAKER], device_speaker_get_fail_status());
+        validate_device_cache(CAT_SPEAKER, g_cache[CAT_SPEAKER]);
         save_atomic("speaker", g_cache[CAT_SPEAKER]);
         cJSON_Delete(speaker);
     }
@@ -408,6 +532,7 @@ void config_manager_sync_device_status(void)
     if (alarm) {
         merge_status(g_cache[CAT_ALARM], alarm);
         update_fail_status(g_cache[CAT_ALARM], device_alarm_get_fail_status());
+        validate_device_cache(CAT_ALARM, g_cache[CAT_ALARM]);
         save_atomic("alarm", g_cache[CAT_ALARM]);
         cJSON_Delete(alarm);
     }
@@ -416,12 +541,59 @@ void config_manager_sync_device_status(void)
     cJSON *mood = device_mood_get_status();
     if (mood) {
         merge_status(g_cache[CAT_MOOD], mood);
+        validate_device_cache(CAT_MOOD, g_cache[CAT_MOOD]);
         save_atomic("mood", g_cache[CAT_MOOD]);
         cJSON_Delete(mood);
     }
 
     printf("[CFG] 设备状态已同步到配置文件\n");
 
+    pthread_mutex_unlock(&g_cfg_mutex);
+}
+
+/**
+ * @brief   快速刷新所有设备配置缓存（内部实现，调用者必须持有 g_cfg_mutex）
+ */
+static void refresh_all_locked(void)
+{
+    cJSON *ptz = device_ptz_get_status();
+    if (ptz) {
+        merge_status(g_cache[CAT_PTZ], ptz);
+        cJSON_Delete(ptz);
+    }
+    cJSON *led = device_led_get_status();
+    if (led) {
+        merge_status(g_cache[CAT_LED], led);
+        cJSON_Delete(led);
+    }
+    cJSON *speaker = device_speaker_get_status();
+    if (speaker) {
+        merge_status(g_cache[CAT_SPEAKER], speaker);
+        cJSON_Delete(speaker);
+    }
+    cJSON *alarm = device_alarm_get_status();
+    if (alarm) {
+        merge_status(g_cache[CAT_ALARM], alarm);
+        cJSON_Delete(alarm);
+    }
+
+    validate_device_cache(CAT_PTZ,     g_cache[CAT_PTZ]);
+    validate_device_cache(CAT_LED,     g_cache[CAT_LED]);
+    validate_device_cache(CAT_SPEAKER, g_cache[CAT_SPEAKER]);
+    validate_device_cache(CAT_ALARM,   g_cache[CAT_ALARM]);
+
+    save_atomic("ptz",     g_cache[CAT_PTZ]);
+    save_atomic("led",     g_cache[CAT_LED]);
+    save_atomic("speaker", g_cache[CAT_SPEAKER]);
+    save_atomic("alarm",   g_cache[CAT_ALARM]);
+}
+
+void config_manager_refresh_all(void)
+{
+    if (!g_inited) return;
+
+    pthread_mutex_lock(&g_cfg_mutex);
+    refresh_all_locked();
     pthread_mutex_unlock(&g_cfg_mutex);
 }
 
@@ -443,6 +615,7 @@ void config_manager_update_after_cmd(int cmd_id)
             cJSON *ptz = device_ptz_get_status();
             if (ptz) {
                 merge_status(g_cache[CAT_PTZ], ptz);
+                validate_device_cache(CAT_PTZ, g_cache[CAT_PTZ]);
                 save_atomic("ptz", g_cache[CAT_PTZ]);
                 cJSON_Delete(ptz);
             }
@@ -454,6 +627,7 @@ void config_manager_update_after_cmd(int cmd_id)
             cJSON *ptz = device_ptz_get_status();
             if (ptz) {
                 merge_status(g_cache[CAT_PTZ], ptz);
+                validate_device_cache(CAT_PTZ, g_cache[CAT_PTZ]);
                 cJSON_Delete(ptz);
             }
             /* 保存预置位数据到 preset_positions.yaml */
@@ -468,6 +642,7 @@ void config_manager_update_after_cmd(int cmd_id)
             cJSON *led = device_led_get_status();
             if (led) {
                 merge_status(g_cache[CAT_LED], led);
+                validate_device_cache(CAT_LED, g_cache[CAT_LED]);
                 save_atomic("led", g_cache[CAT_LED]);
                 cJSON_Delete(led);
             }
@@ -482,6 +657,7 @@ void config_manager_update_after_cmd(int cmd_id)
             cJSON *speaker = device_speaker_get_status();
             if (speaker) {
                 merge_status(g_cache[CAT_SPEAKER], speaker);
+                validate_device_cache(CAT_SPEAKER, g_cache[CAT_SPEAKER]);
                 save_atomic("speaker", g_cache[CAT_SPEAKER]);
                 cJSON_Delete(speaker);
             }
@@ -494,15 +670,17 @@ void config_manager_update_after_cmd(int cmd_id)
             cJSON *alarm = device_alarm_get_status();
             if (alarm) {
                 merge_status(g_cache[CAT_ALARM], alarm);
+                validate_device_cache(CAT_ALARM, g_cache[CAT_ALARM]);
                 save_atomic("alarm", g_cache[CAT_ALARM]);
                 cJSON_Delete(alarm);
             }
         }
         break;
 
-    /* ---- 系统状态采集 cmd=601：更新全部设备 config ---- */
+    /* ---- 系统状态采集 cmd=601：快速同步（trylock，无硬件 I/O） ---- */
     case CMD_SYS_STATUS: /* 601 */
-        config_manager_sync_device_status();
+        printf("[CFG] cmd=601 状态采集，快速同步设备状态（无硬件查询）\n");
+        refresh_all_locked();
         break;
 
     /* ---- 服务器配置 cmd=605：serverUrl 可能变更 ---- */
@@ -527,6 +705,7 @@ void config_manager_update_mood(void)
     cJSON *mood = device_mood_get_status();
     if (mood) {
         merge_status(g_cache[CAT_MOOD], mood);
+        validate_device_cache(CAT_MOOD, g_cache[CAT_MOOD]);
         save_atomic("mood", g_cache[CAT_MOOD]);
         cJSON_Delete(mood);
     }
@@ -590,6 +769,177 @@ bool config_manager_get_auth_token(char *dest, size_t size)
     }
     pthread_mutex_unlock(&g_cfg_mutex);
     return ok;
+}
+
+/* ======================================================================== */
+/*  缓存状态读取（不访问硬件）                                                   */
+/* ======================================================================== */
+
+cJSON *config_manager_get_ptz_status(void)
+{
+    if (!g_inited) return NULL;
+    pthread_mutex_lock(&g_cfg_mutex);
+    cJSON *result = g_cache[CAT_PTZ] ? cJSON_Duplicate(g_cache[CAT_PTZ], 1) : NULL;
+    pthread_mutex_unlock(&g_cfg_mutex);
+    return result;
+}
+
+cJSON *config_manager_get_led_status(void)
+{
+    if (!g_inited) return NULL;
+    pthread_mutex_lock(&g_cfg_mutex);
+    cJSON *result = g_cache[CAT_LED] ? cJSON_Duplicate(g_cache[CAT_LED], 1) : NULL;
+    pthread_mutex_unlock(&g_cfg_mutex);
+    return result;
+}
+
+cJSON *config_manager_get_speaker_status(void)
+{
+    if (!g_inited) return NULL;
+    pthread_mutex_lock(&g_cfg_mutex);
+    cJSON *result = g_cache[CAT_SPEAKER] ? cJSON_Duplicate(g_cache[CAT_SPEAKER], 1) : NULL;
+    pthread_mutex_unlock(&g_cfg_mutex);
+    return result;
+}
+
+cJSON *config_manager_get_alarm_status(void)
+{
+    if (!g_inited) return NULL;
+    pthread_mutex_lock(&g_cfg_mutex);
+    cJSON *result = g_cache[CAT_ALARM] ? cJSON_Duplicate(g_cache[CAT_ALARM], 1) : NULL;
+    pthread_mutex_unlock(&g_cfg_mutex);
+    return result;
+}
+
+cJSON *config_manager_get_mood_status(void)
+{
+    if (!g_inited) return NULL;
+    pthread_mutex_lock(&g_cfg_mutex);
+    cJSON *result = g_cache[CAT_MOOD] ? cJSON_Duplicate(g_cache[CAT_MOOD], 1) : NULL;
+    pthread_mutex_unlock(&g_cfg_mutex);
+    return result;
+}
+
+void config_manager_send_pending_upgrade_response(ws_send_queue_t *send_queue)
+{
+    if (!g_inited || !send_queue) return;
+
+    /* 检查 upgrade_pending.json 是否存在 */
+    struct stat st;
+    if (stat(FW_PENDING_RESPONSE, &st) != 0) {
+        return;  /* 无待发送响应，正常情况 */
+    }
+
+    printf("[CFG] 发现待发送升级响应: %s\n", FW_PENDING_RESPONSE);
+
+    /* 读取文件 */
+    FILE *fp = fopen(FW_PENDING_RESPONSE, "r");
+    if (!fp) {
+        fprintf(stderr, "[CFG] 无法读取 %s: %s\n",
+                FW_PENDING_RESPONSE, strerror(errno));
+        return;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    if (fsize <= 0 || fsize > 4096) {
+        fclose(fp);
+        fprintf(stderr, "[CFG] %s 大小异常: %ld\n", FW_PENDING_RESPONSE, fsize);
+        unlink(FW_PENDING_RESPONSE);
+        return;
+    }
+
+    char *buf = (char *)calloc(1, (size_t)fsize + 1);
+    if (!buf) {
+        fclose(fp);
+        return;
+    }
+
+    fseek(fp, 0, SEEK_SET);
+    size_t nread = fread(buf, 1, (size_t)fsize, fp);
+    fclose(fp);
+
+    if (nread != (size_t)fsize) {
+        fprintf(stderr, "[CFG] 读取 %s 不完整\n", FW_PENDING_RESPONSE);
+        free(buf);
+        unlink(FW_PENDING_RESPONSE);
+        return;
+    }
+
+    cJSON *pending = cJSON_Parse(buf);
+    free(buf);
+
+    if (!pending) {
+        fprintf(stderr, "[CFG] %s JSON 解析失败\n", FW_PENDING_RESPONSE);
+        unlink(FW_PENDING_RESPONSE);
+        return;
+    }
+
+    /* 读取字段 */
+    cJSON *j_to_ver   = cJSON_GetObjectItem(pending, "toVer");
+    cJSON *j_token    = cJSON_GetObjectItem(pending, "token");
+    cJSON *j_from_ver = cJSON_GetObjectItem(pending, "fromVer");
+
+    const char *to_ver_str  = cJSON_IsString(j_to_ver) ? j_to_ver->valuestring : NULL;
+    const char *from_ver_str = cJSON_IsString(j_from_ver) ? j_from_ver->valuestring : "?";
+    const char *token = cJSON_IsString(j_token) ? j_token->valuestring : NULL;
+
+    /* 校验目标版本与当前运行时版本是否匹配 */
+    const char *running_ver = config_manager_get_fw_version();
+    cJSON *response = NULL;
+
+    if (to_ver_str && compare_versions(to_ver_str, running_ver) == 0) {
+        printf("[CFG] 升级成功: %s → %s\n",
+               from_ver_str, running_ver);
+        response = msg_build_cmd_response(0, 604, "upgrade successful");
+    } else {
+        printf("[CFG] 警告: 目标版本 '%s' 与当前 '%s' 不匹配\n",
+               to_ver_str ? to_ver_str : "(null)",
+               running_ver);
+        response = msg_build_cmd_response(ERR_DEVICE_COMM, 604,
+                                          "upgrade version mismatch");
+    }
+
+    /* 回传 token（若存在） */
+    if (token && token[0] != '\0' && response) {
+        cJSON *old = cJSON_DetachItemFromObject(response, "msg");
+        /* msg_build_cmd_response 已设置 msg，token 需手动添加 */
+        (void)old;
+        cJSON_AddStringToObject(response, "token", token);
+    }
+
+    /* 发送 */
+    if (response) {
+        char *resp_str = cJSON_PrintUnformatted(response);
+        if (resp_str) {
+            printf("[CFG] 发送升级响应: %s\n", resp_str);
+            ws_send_queue_enqueue(send_queue, resp_str);
+            /* resp_str 所有权转移给 send_queue */
+        }
+        cJSON_Delete(response);
+    }
+
+    cJSON_Delete(pending);
+
+    /* 删除 pending 文件，避免下次启动重复发送 */
+    if (unlink(FW_PENDING_RESPONSE) != 0) {
+        fprintf(stderr, "[CFG] 警告: 无法删除 %s: %s\n",
+                FW_PENDING_RESPONSE, strerror(errno));
+    } else {
+        printf("[CFG] %s 已删除\n", FW_PENDING_RESPONSE);
+    }
+}
+
+const char *config_manager_get_fw_version(void)
+{
+    if (!g_inited || !g_cache[CAT_SYSTEM]) {
+        return CTRL_BOARD_FW_VERSION;
+    }
+    cJSON *fw = cJSON_GetObjectItem(g_cache[CAT_SYSTEM], "fwVersion");
+    if (cJSON_IsString(fw) && fw->valuestring && fw->valuestring[0] != '\0') {
+        return fw->valuestring;
+    }
+    return CTRL_BOARD_FW_VERSION;
 }
 
 void config_manager_deinit(void)

@@ -11,12 +11,7 @@
 #include <time.h>
 
 #include "config.h"
-
-#include "device_ptz.h"
-#include "device_led.h"
-#include "device_speaker.h"
-#include "device_alarm.h"
-#include "device_mood.h"
+#include "config_manager.h"
 
 /* ======================================================================== */
 /*  内部辅助                                                                  */
@@ -35,6 +30,25 @@ static cJSON *make_push(const char *event)
     return root;
 }
 
+/**
+ * @brief   自主模式（扫描/巡航）下移除角度字段
+ *
+ *          merge_status() 只增不改不删，PTZ 进入自主模式后缓存中仍保留
+ *          旧的 horizontalAngle/verticalAngle。但自主模式中角度持续变化，
+ *          返回无意义，需在输出前剥离。
+ */
+static void strip_ptz_angles_in_autonomous(cJSON *ptz)
+{
+    if (!ptz) return;
+    cJSON *state = cJSON_GetObjectItem(ptz, "state");
+    if (cJSON_IsString(state) &&
+        (strcmp(state->valuestring, "scanning") == 0 ||
+         strcmp(state->valuestring, "cruising") == 0)) {
+        cJSON_DeleteItemFromObject(ptz, "horizontalAngle");
+        cJSON_DeleteItemFromObject(ptz, "verticalAngle");
+    }
+}
+
 /* ======================================================================== */
 /*  出站推送消息（Board → Server）                                           */
 /* ======================================================================== */
@@ -45,7 +59,7 @@ cJSON *msg_build_heartbeat(long uptime_sec)
     cJSON *data = cJSON_AddObjectToObject(root, "data");
 
     cJSON_AddStringToObject(data, "model",      CTRL_BOARD_MODEL);
-    cJSON_AddStringToObject(data, "fw_version", CTRL_BOARD_FW_VERSION);
+    cJSON_AddStringToObject(data, "fw_version", config_manager_get_fw_version());
     cJSON_AddNumberToObject(data, "uptime",     (double)uptime_sec);
     cJSON_AddStringToObject(data, "status",     "online");
 
@@ -57,11 +71,18 @@ cJSON *msg_build_device_status(void)
     cJSON *root = make_push("device_status");
     cJSON *data = cJSON_AddObjectToObject(root, "data");
 
-    cJSON_AddItemToObject(data, "ptz",     device_ptz_get_status());
-    cJSON_AddItemToObject(data, "led",     device_led_get_status());
-    cJSON_AddItemToObject(data, "speaker", device_speaker_get_status());
-    cJSON_AddItemToObject(data, "alarm",   device_alarm_get_status());
-    cJSON_AddItemToObject(data, "mood",    device_mood_get_status());
+    /*
+     * 从配置缓存读取设备状态，不查询硬件，避免与 worker 线程竞争设备互斥锁。
+     * 缓存由 config_manager_update_after_cmd() 在每次命令执行后保持同步。
+     */
+    cJSON_AddItemToObject(data, "ptz",     config_manager_get_ptz_status());
+    cJSON_AddItemToObject(data, "led",     config_manager_get_led_status());
+    cJSON_AddItemToObject(data, "speaker", config_manager_get_speaker_status());
+    cJSON_AddItemToObject(data, "alarm",   config_manager_get_alarm_status());
+    cJSON_AddItemToObject(data, "mood",    config_manager_get_mood_status());
+
+    /* 自主模式下移除 ptz 中的角度字段 */
+    strip_ptz_angles_in_autonomous(cJSON_GetObjectItem(data, "ptz"));
 
     return root;
 }
@@ -134,32 +155,47 @@ cJSON *msg_build_cmd_response(int code, int cmd, const char *msg)
 
 /**
  * @brief   cmd=601 状态采集响应
- *          规格书格式: { "cmd": 601, "result": 0 }
+ *          规格书格式: { "cmd": 601, "result": 0, "token": "...",
+ *                        "ptz":{...}, "led":{...}, "speaker":{...}, "alarm":{...} }
  */
-cJSON *msg_build_sys_status_response(int result)
+cJSON *msg_build_sys_status_response(int result, const char *token)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "cmd",    601);
     cJSON_AddNumberToObject(root, "result", result);
 
-    /* V2.7: cmd=601 返回全量设备状态 */
-    cJSON_AddItemToObject(root, "ptz",     device_ptz_get_status());
-    cJSON_AddItemToObject(root, "led",     device_led_get_status());
-    cJSON_AddItemToObject(root, "speaker", device_speaker_get_status());
-    cJSON_AddItemToObject(root, "alarm",   device_alarm_get_status());
+    /* 回传 token，便于服务端关联请求 */
+    if (token && token[0] != '\0') {
+        cJSON_AddStringToObject(root, "token", token);
+    }
+
+    /*
+     * 从配置缓存读取设备状态，不查询硬件，避免阻塞主线程。
+     * cmd=601 在主线程内联执行，任何串口 I/O 或 mutex 等待都会冻结
+     * 整个主循环，导致无法接收新的 WebSocket 消息。
+     *
+     * 不含 mood（氛围灯），与接口规格书（测试功能.txt）保持一致。
+     */
+    cJSON_AddItemToObject(root, "ptz",     config_manager_get_ptz_status());
+    cJSON_AddItemToObject(root, "led",     config_manager_get_led_status());
+    cJSON_AddItemToObject(root, "speaker", config_manager_get_speaker_status());
+    cJSON_AddItemToObject(root, "alarm",   config_manager_get_alarm_status());
+
+    /* 自主模式下移除 ptz 中的角度字段 */
+    strip_ptz_angles_in_autonomous(cJSON_GetObjectItem(root, "ptz"));
 
     return root;
 }
 
 /**
  * @brief   cmd=603 版本查询响应
- *          规格书格式: { "cmd": 603, "mainVer": N }
+ *          格式: { "cmd": 603, "mainVer": "1.0.0" }
  */
-cJSON *msg_build_sys_version_response(int mainVer)
+cJSON *msg_build_sys_version_response(const char *version)
 {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "cmd",     603);
-    cJSON_AddNumberToObject(root, "mainVer", mainVer);
+    cJSON_AddStringToObject(root, "mainVer", version ? version : "");
     return root;
 }
 

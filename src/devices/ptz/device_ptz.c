@@ -161,6 +161,24 @@ static void hardware_force_stop(void)
     g_moving      = 0;
     g_autonomous  = 0;
     g_active_scan = 0;
+
+    /*
+     * 停止后查询硬件实际角度，更新缓存。
+     * 此时硬件已退出自主模式，RS-485 总线空闲，查询可以正常收到响应。
+     */
+    {
+        double hw_pan = 0.0, hw_tilt = 0.0;
+        if (gimbal_query_pan(&g_gimbal, &hw_pan) == 0) {
+            g_current_h_angle = (int)(hw_pan + 0.5);
+        }
+        usleep(50000);
+        if (gimbal_query_tilt(&g_gimbal, &hw_tilt) == 0) {
+            g_current_v_angle = (int)(hw_tilt + 0.5);
+        }
+        printf("[PTZ] 停止后角度: h=%d° v=%d°\n",
+               g_current_h_angle, g_current_v_angle);
+    }
+
     printf("[PTZ] 硬件强制停止序列完成\n");
 }
 
@@ -273,6 +291,23 @@ static void stop_autonomous_mode(void)
     g_autonomous = 0;
     g_active_scan = 0;
 
+    /*
+     * 停止后查询硬件实际角度，更新缓存。
+     * 此时硬件已退出自主模式，RS-485 总线空闲。
+     */
+    {
+        double hw_pan = 0.0, hw_tilt = 0.0;
+        if (gimbal_query_pan(&g_gimbal, &hw_pan) == 0) {
+            g_current_h_angle = (int)(hw_pan + 0.5);
+        }
+        usleep(50000);
+        if (gimbal_query_tilt(&g_gimbal, &hw_tilt) == 0) {
+            g_current_v_angle = (int)(hw_tilt + 0.5);
+        }
+        printf("[PTZ] 停止后角度: h=%d° v=%d°\n",
+               g_current_h_angle, g_current_v_angle);
+    }
+
     printf("[PTZ] 运动已停止\n");
 }
 
@@ -334,12 +369,6 @@ static int handle_move(const cmd_t *cmd, cJSON **resp)
         if (axis < 1 || axis > 2) {
             if (resp) *resp = msg_build_response(ERR_PARAM_INVALID,
                                                  "axis 无效，应为 1(水平) 或 2(垂直)");
-            return -1;
-        }
-
-        if (angle <= 0) {
-            if (resp) *resp = msg_build_response(ERR_PARAM_INVALID,
-                                                 "dir=0 时 angle 必须 > 0（绝对目标角度）");
             return -1;
         }
 
@@ -1211,16 +1240,11 @@ int device_ptz_execute(const cmd_t *cmd, cJSON **resp)
 cJSON *device_ptz_get_status(void)
 {
     /*
-     * V3.1: 使用 trylock 防阻塞。
-     *
-     * 本函数被心跳线程和主线程（cmd=601）频繁调用。
-     * PTZ worker 执行长耗时操作（如 gimbal_initialize_presets 轮询到位
-     * 最长 120s×N）时持有 g_gimbal_mutex，若用 lock 会阻塞心跳和主循环。
-     *
-     * trylock 失败时直接无锁读取缓存 int 值——在 ARM/x86 上 int 读取
-     * 是单指令，不会读到撕裂值；状态上报允许微量偏差。
+     * 使用 trylock 防阻塞。本函数被心跳线程和 config_manager 调用，
+     * PTZ worker 执行长耗时操作时持有 g_gimbal_mutex，trylock 失败则
+     * 无锁读取 int 缓存值（ARM/x86 上 int 读取为单指令，安全）。
      */
-    int h_angle, v_angle, speed, moving, autonomous, fail;
+    int h_angle, v_angle, speed, moving, autonomous, active_scan, fail;
 
     if (pthread_mutex_trylock(&g_gimbal_mutex) == 0) {
         h_angle     = g_current_h_angle;
@@ -1228,25 +1252,53 @@ cJSON *device_ptz_get_status(void)
         speed       = g_current_speed;
         moving      = g_moving;
         autonomous  = g_autonomous;
+        active_scan = g_active_scan;
         fail        = g_fail_status;
         pthread_mutex_unlock(&g_gimbal_mutex);
     } else {
-        /* mutex 被 PTZ worker 持有（预置位初始化等长操作），无锁读取 */
         h_angle     = g_current_h_angle;
         v_angle     = g_current_v_angle;
         speed       = g_current_speed;
         moving      = g_moving;
         autonomous  = g_autonomous;
+        active_scan = g_active_scan;
         fail        = g_fail_status;
     }
 
     cJSON *status = cJSON_CreateObject();
-    cJSON_AddBoolToObject  (status, "online",           (fail != 1));
-    cJSON_AddNumberToObject(status, "horizontalAngle",  h_angle);
-    cJSON_AddNumberToObject(status, "verticalAngle",    v_angle);
-    cJSON_AddNumberToObject(status, "speed",            speed);
-    cJSON_AddBoolToObject  (status, "moving",           (moving != 0));
-    cJSON_AddBoolToObject  (status, "autonomous",       (autonomous != 0));
+    cJSON_AddBoolToObject(status, "online", (fail != 1));
+
+    /*
+     * 根据运行模式设置 state 字段：
+     *   autonomous && active_scan  → "scanning"  (cmd=105)
+     *   autonomous && !active_scan → "cruising"  (cmd=104)
+     *   !autonomous && moving      → "moving"    (cmd=101/102 手动运动)
+     *   !autonomous && !moving     → "idle"
+     *
+     * 自主模式（扫描/巡航）期间 RS-485 总线被硬件上报帧占满（~29ms/帧），
+     * 禁止查询硬件角度，响应中不返回 horizontalAngle/verticalAngle，
+     * 仅返回运行模式和速度。
+     */
+    const char *state_str;
+    if (autonomous && active_scan) {
+        state_str = "scanning";
+    } else if (autonomous && !active_scan) {
+        state_str = "cruising";
+    } else if (!autonomous && moving) {
+        state_str = "moving";
+    } else {
+        state_str = "idle";
+    }
+    cJSON_AddStringToObject(status, "state", state_str);
+
+    cJSON_AddNumberToObject(status, "speed", speed);
+
+    /* 仅在非自主模式下返回角度（自主模式角度持续变化，返回无意义） */
+    if (!autonomous) {
+        cJSON_AddNumberToObject(status, "horizontalAngle", h_angle);
+        cJSON_AddNumberToObject(status, "verticalAngle",   v_angle);
+    }
+
     return status;
 }
 

@@ -192,6 +192,68 @@ async def handle_query_response(ws, msg):
         result = msg.get("result", -1)
         status = "成功" if result == 0 else f"失败({result})"
         print(f"\n<<< 状态采集回复 [{remote}]: {status}")
+
+        # 打印各设备状态详情
+        def _print_device(title, data, fields):
+            """辅助：美化打印一个设备的状态字段"""
+            if not isinstance(data, dict):
+                print(f"    {title}: (无数据)")
+                return
+            print(f"  [{title}]")
+            for key, label in fields:
+                val = data.get(key)
+                print(f"    {label:20s}  {val}")
+
+        # --- 云台（V3.3: state 字段，自主模式不返回角度） ---
+        ptz = msg.get("ptz")
+        if isinstance(ptz, dict):
+            state = ptz.get("state", "idle")
+            state_cn = {"idle": "空闲", "moving": "移动中",
+                        "scanning": "扫描中", "cruising": "巡航中"}
+            print(f"  [云台] 状态: {state_cn.get(state, state)}")
+            print(f"    在线状态:            {ptz.get('online', '?')}")
+            print(f"    速度:                {ptz.get('speed', '?')}")
+            # 自主模式（扫描/巡航）不返回角度
+            if state in ("idle", "moving"):
+                print(f"    水平角度 (°):        {ptz.get('horizontalAngle', '?')}")
+                print(f"    垂直角度 (°):        {ptz.get('verticalAngle', '?')}")
+            print(f"    故障状态:            {ptz.get('failStatus', '?')}")
+        else:
+            print(f"  [云台] (无数据)")
+
+        # --- LED ---
+        led = msg.get("led")
+        _print_device("LED 字幕屏", led, [
+            ("online",        "在线状态"),
+            ("lightVal",      "亮度"),
+            ("showType",      "播放模式"),
+            ("displayStyle",  "滚动样式"),
+        ])
+        if isinstance(led, dict):
+            td = led.get("textData", [])
+            if isinstance(td, list) and td:
+                print(f"    字幕内容:")
+                for item in td:
+                    if isinstance(item, dict):
+                        print(f"      [{item.get('textindex', '?')}] {item.get('text', '')}")
+
+        # --- 音箱 ---
+        spk = msg.get("speaker")
+        _print_device("音箱", spk, [
+            ("online",      "在线状态"),
+            ("audioIndex",  "当前音频索引"),
+            ("volume",      "音量"),
+            ("playType",    "播放模式"),
+            ("playData",    "播放数据"),
+        ])
+
+        # --- 警灯 ---
+        alarm = msg.get("alarm")
+        _print_device("警灯", alarm, [
+            ("online",    "在线状态"),
+            ("state",     "开关状态"),
+            ("lightType", "闪灯模式"),
+        ])
         return
 
     if cmd == 603:
@@ -512,7 +574,7 @@ async def console_menu():
             await send_cmd_to_client(ws, {"cmd": 603, "token": token})
 
         elif choice == "4":
-            ver = int(input("  新版本号: ").strip() or "3")
+            ver = input("  新版本号: ").strip() or "2.0.0"
             url = input("  固件URL: ").strip() or "http://192.168.1.100/firmware/v3.bin"
             await send_cmd_to_client(ws, {
                 "cmd": 604, "token": token, "mainVer": ver, "downUrl": url

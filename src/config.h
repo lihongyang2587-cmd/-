@@ -88,7 +88,34 @@ extern "C" {
 /* ======================================================================== */
 
 #define CTRL_BOARD_MODEL        "RobotController-V1.0"
-#define CTRL_BOARD_FW_VERSION   "2"
+#define CTRL_BOARD_FW_VERSION   "1.0.0"
+
+/* ======================================================================== */
+/*  固件升级配置                                                              */
+/* ======================================================================== */
+
+/** 固件下载临时目录 */
+#define FW_DOWNLOAD_DIR         "/tmp/device_fw_update"
+
+/** 下载超时（秒），wget 和 curl 各自使用 */
+#define FW_DOWNLOAD_TIMEOUT_SEC 120
+
+/** 看门狗等待父进程退出超时（秒），超时后强制 SIGKILL（保留，升级脚本已废弃） */
+#define FW_WATCHDOG_TIMEOUT_SEC 30
+
+/** 待发送升级响应文件（新程序启动后读取并发送，含 newBin/targetBin 供看门狗使用） */
+#define FW_PENDING_RESPONSE     "./config/upgrade_pending.json"
+
+/* ---- 看门狗守护进程 ---- */
+
+/** 主进程 PID 文件，看门狗通过此文件监控主进程存活状态 */
+#define DEVICE_APP_PID_FILE     "/tmp/device_app.pid"
+
+/** 看门狗自身 PID 文件，用于防止重复启动 */
+#define WATCHDOG_PID_FILE       "/tmp/device_watchdog.pid"
+
+/** 看门狗检测间隔（秒） */
+#define WATCHDOG_CHECK_INTERVAL 30
 
 /* ======================================================================== */
 /*  API 错误码（V2.6）                                                        */

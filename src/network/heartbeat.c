@@ -17,6 +17,7 @@
 #include <pthread.h>
 
 #include "msg_builder.h"
+#include "config_manager.h"
 #include "config.h"
 
 /* ======================================================================== */
@@ -54,7 +55,8 @@ static void *heartbeat_thread(void *arg)
             /* hb_str 所有权已转移到 send_queue */
         }
 
-        /* 2. 发送设备状态 */
+        /* 2. 发送设备状态（先刷新缓存，确保上报实时数据） */
+        config_manager_refresh_all();
         cJSON *status_json = msg_build_device_status();
         char  *status_str  = msg_to_string(status_json);
         if (status_str) {

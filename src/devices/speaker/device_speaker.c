@@ -1006,7 +1006,7 @@ cJSON *device_speaker_get_status(void)
     cJSON *status = cJSON_CreateObject();
     cJSON_AddBoolToObject  (status, "online",     (fs == 0));
     cJSON_AddNumberToObject(status, "volume",     vol);
-    cJSON_AddNumberToObject(status, "audioIndex", idx);
+    cJSON_AddNumberToObject(status, "audioIndex", idx >= 0 ? idx : 0);
     cJSON_AddNumberToObject(status, "playType",   pt);
     cJSON_AddNumberToObject(status, "playData",   pd);
 
