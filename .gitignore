@@ -25,6 +25,12 @@ __pycache__/
 *.doc
 *.pdf
 *.html
+CLAUDE.md
+README.md
+关键信息.txt
+参数必须性说明.txt
+接口对照表.md
+测试功能.txt
 
 # 密钥
 *.pem
