@@ -30,6 +30,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <ctype.h>
 
 #include "msg_builder.h"
@@ -47,6 +48,8 @@
 #define LOOP_GAP_US         500000      /* 循环播放间隔 0.5s */
 #define SEQ_GAP_US          500000      /* 顺序播放间隔 0.5s */
 #define POLL_INTERVAL_US    200000      /* 子进程轮询间隔 200ms */
+#define MAX_PLAY_RETRY      3           /* aplay 异常退出最多重试次数 */
+#define RETRY_DELAY_US      500000      /* 重试前等待 500ms */
 
 #ifndef ERR_SUCCESS
 #define ERR_SUCCESS         0
@@ -90,10 +93,11 @@ static int             g_volume           = DEFAULT_VOLUME;
 static int             g_playing          = 0;       /* 正在播放 */
 static int             g_paused           = 0;       /* 已暂停 */
 static int             g_current_audio    = -1;      /* 当前播放的 audio index */
-static pid_t           g_player_pid       = -1;      /* 当前播放子进程 */
+static volatile pid_t  g_player_pid       = -1;      /* 当前播放子进程（volatile：多线程读写） */
 static pthread_t       g_play_thread;
 static volatile int    g_thread_active    = 0;
 static volatile int    g_stop_flag        = 0;       /* 通知播放线程退出 */
+static volatile int    g_insert_active    = 0;       /* 插播进行中，防止嵌套插播 */
 static volatile int    g_status_changed   = 0;
 static play_request_t  g_request;                     /* 当前播放请求 */
 
@@ -244,7 +248,7 @@ static const char *get_audio_path(int index)
 }
 
 /**
- * @brief   终止播放子进程（处理已暂停状态）
+ * @brief   终止播放子进程（仅发信号，不 wait——由 play_file_blocking 统一回收）
  */
 static void kill_player(void)
 {
@@ -258,9 +262,7 @@ static void kill_player(void)
         if (kill(g_player_pid, 0) == 0) {
             kill(g_player_pid, SIGKILL);
         }
-        int status;
-        waitpid(g_player_pid, &status, 0);
-        g_player_pid = -1;
+        /* 不 waitpid —— 由 play_file_blocking() 回收子进程 */
     }
 }
 
@@ -301,69 +303,112 @@ static int play_file_blocking(const char *filepath)
         return -1;
     }
 
-    /* 构建播放命令 */
-    char cmd[1024];
+    /* 判断文件类型 */
     const char *dot = strrchr(filepath, '.');
-    if (dot && strcasecmp(dot, ".wav") == 0) {
-        snprintf(cmd, sizeof(cmd),
-                 "aplay -D plughw:%d,0 '%s' 2>/dev/null",
-                 g_alsa_card, filepath);
-    } else {
-        /* MP3 及其他格式使用 mpg123 */
-        snprintf(cmd, sizeof(cmd),
-                 "mpg123 -q -a plughw:%d,0 '%s' 2>/dev/null",
-                 g_alsa_card, filepath);
-    }
+    int is_wav = (dot && strcasecmp(dot, ".wav") == 0);
 
-    printf("[SPK] 播放: %s\n", cmd);
+    for (int retry = 0; retry < MAX_PLAY_RETRY; retry++) {
+        if (g_stop_flag) return -1;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("[SPK] fork 失败");
+        if (retry > 0) {
+            printf("[SPK] 重试播放 (%d/%d): %s\n",
+                   retry + 1, MAX_PLAY_RETRY, filepath);
+            usleep(RETRY_DELAY_US);
+        } else {
+            printf("[SPK] 播放: %s (%s)\n", filepath, is_wav ? "WAV" : "MP3");
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("[SPK] fork 失败");
+            return -1;
+        }
+        if (pid == 0) {
+            /*
+             * 子进程：直接 exec 播放器，不通过 shell。
+             * stderr 保留原样不重定向，确保 aplay/mpg123 的错误信息可见。
+             */
+            char device[64];
+            snprintf(device, sizeof(device), "plughw:%d,0", g_alsa_card);
+
+            if (is_wav) {
+                execlp("aplay", "aplay", "-D", device, filepath, NULL);
+            } else {
+                execlp("mpg123", "mpg123", "-q", "-a", device, filepath, NULL);
+            }
+            /* execlp 失败才走到这里 */
+            fprintf(stderr, "[SPK] exec 失败: %s (errno=%d, %s)\n",
+                    is_wav ? "aplay" : "mpg123", errno, strerror(errno));
+            _exit(127);
+        }
+
+        g_player_pid = pid;
+        g_playing = 1;
+        g_fail_status = 0;
+        notify_status_changed();
+
+        /* 等待子进程，定期检查 g_stop_flag */
+        int status;
+        int should_retry = 0;
+
+        while (!g_stop_flag) {
+            pid_t re = waitpid(pid, &status, WNOHANG | WUNTRACED);
+            if (re == pid) {
+                if (WIFSTOPPED(status)) {
+                    /* 子进程被 SIGSTOP 暂停，继续轮询等待恢复或终止 */
+                    usleep(POLL_INTERVAL_US);
+                    continue;
+                }
+                /* 子进程已退出 */
+                g_player_pid = -1;
+                if (WIFEXITED(status)) {
+                    int code = WEXITSTATUS(status);
+                    if (code == 0) {
+                        g_fail_status = 0;
+                        printf("[SPK] 播放完成: %s\n", filepath);
+                        return 0;
+                    }
+                    printf("[SPK] 播放异常退出: %s (exit=%d)\n", filepath, code);
+                    if (retry < MAX_PLAY_RETRY - 1) {
+                        should_retry = 1;
+                    }
+                } else if (WIFSIGNALED(status)) {
+                    printf("[SPK] 播放被信号终止: %s (sig=%d)\n",
+                           filepath, WTERMSIG(status));
+                }
+                break;  /* 退出 wait 循环 */
+            }
+            if (re < 0) {
+                g_player_pid = -1;
+                printf("[SPK] waitpid 错误: %s (errno=%d)\n", filepath, errno);
+                g_fail_status = 2;
+                return -1;
+            }
+            usleep(POLL_INTERVAL_US);
+        }
+
+        if (should_retry) continue;  /* 下一轮重试 */
+
+        /* 被要求停止 → 杀掉子进程 */
+        if (g_stop_flag) {
+            if (kill(pid, 0) == 0) {
+                kill(pid, SIGCONT);         /* 若处于 STOP 状态先唤醒 */
+                usleep(10000);
+                kill(pid, SIGTERM);
+                usleep(100000);
+                if (kill(pid, 0) == 0) kill(pid, SIGKILL);
+            }
+            waitpid(pid, &status, 0);
+            g_player_pid = -1;
+            printf("[SPK] 播放已停止: %s\n", filepath);
+        }
+
+        g_fail_status = 2;
         return -1;
     }
-    if (pid == 0) {
-        /* 子进程：执行播放命令 */
-        execlp("sh", "sh", "-c", cmd, NULL);
-        _exit(127);
-    }
 
-    g_player_pid = pid;
-    g_playing = 1;
-    notify_status_changed();
-
-    /* 等待子进程，定期检查 g_stop_flag */
-    int status;
-    while (!g_stop_flag) {
-        pid_t ret = waitpid(pid, &status, WNOHANG);
-        if (ret == pid) {
-            /* 子进程已退出（正常或异常） */
-            g_player_pid = -1;
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-                g_fail_status = 0;  /* 播放正常结束 */
-                return 0;
-            }
-            if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
-                fprintf(stderr, "[SPK] 播放器未找到（sh -c 执行失败）\n");
-            }
-            g_fail_status = 2;  /* 播放异常 */
-            return -1;
-        }
-        if (ret < 0) {
-            g_player_pid = -1;
-            return -1;
-        }
-        usleep(POLL_INTERVAL_US);
-    }
-
-    /* 被要求停止 → 杀掉子进程 */
-    kill(pid, SIGCONT);
-    usleep(10000);
-    kill(pid, SIGTERM);
-    usleep(100000);
-    if (kill(pid, 0) == 0) kill(pid, SIGKILL);
-    waitpid(pid, &status, 0);
-    g_player_pid = -1;
+    /* 所有重试已耗尽 */
+    g_fail_status = 2;
     return -1;
 }
 
@@ -472,9 +517,24 @@ static void *play_thread_func(void *arg)
                 fprintf(stderr, "[SPK] 音频 %d 不存在\n", req.audio_index);
                 break;
             }
+            time_t t0 = time(NULL);
             play_file_blocking(path);
             if (g_stop_flag) break;
-            usleep(LOOP_GAP_US);
+
+            /*
+             * 若子进程在 2 秒内就退出了（异常短），可能是 aplay 启动失败，
+             * 额外冷却 3 秒避免日志刷屏和 CPU 空转。
+             */
+            time_t elapsed = time(NULL) - t0;
+            if (elapsed < 2) {
+                printf("[SPK] 播放异常短 (%ld 秒)，冷却 3 秒后重试...\n",
+                       (long)elapsed);
+                for (int cool = 0; cool < 30 && !g_stop_flag; cool++) {
+                    usleep(100000);  /* 100ms × 30 = 3 秒 */
+                }
+            } else {
+                usleep(LOOP_GAP_US);
+            }
         }
         break;
     }
@@ -488,6 +548,8 @@ static void *play_thread_func(void *arg)
                 continue;
             }
             play_file_blocking(path);
+            if (g_stop_flag) break;
+
             if (!g_stop_flag && i < req.seq_count - 1) {
                 usleep(SEQ_GAP_US);
             }
@@ -520,6 +582,7 @@ static void *play_thread_func(void *arg)
         } else {
             fprintf(stderr, "[SPK] 音频 %d 不存在\n", req.audio_index);
         }
+
         break;
     }
 
@@ -546,6 +609,15 @@ static int start_playback(const play_request_t *req)
 {
     /* 停止旧播放 */
     join_play_thread();
+
+    /*
+     * 清理任何残留的孤儿 aplay/mpg123 进程。
+     * 旧 sh -c 包装方式可能导致 shell 被杀后 aplay 变成孤儿（PPID=1），
+     * 霸占 ALSA 设备导致后续播放报 "Device or resource busy"。
+     */
+    int ret = system("killall -9 aplay mpg123 2>/dev/null");
+    (void)ret;
+    usleep(100000);  /* 等 100ms 确保 ALSA 设备释放 */
 
     g_stop_flag     = 0;
     g_playing        = 0;
@@ -630,22 +702,24 @@ int device_speaker_execute(const cmd_t *cmd, cJSON **resp)
     if (cmd->cmd_id == 301) {
 
         int play_flag   = cmd_get_int(cmd, "play",   0);
+        int resume_flag = cmd_get_int(cmd, "resume", 0);
         int pause_flag  = cmd_get_int(cmd, "pause",  0);
         int stop_flag   = cmd_get_int(cmd, "stop",   0);
         int vol_req     = cmd_get_int(cmd, "volume", 0);
         int play_type   = cmd_get_int(cmd, "playType", 0);
         int audio_index = cmd_get_int(cmd, "audioIndex", -1);
 
-        printf("[SPK] 播放控制: play=%d pause=%d stop=%d vol=%d type=%d idx=%d\n",
-               play_flag, pause_flag, stop_flag, vol_req, play_type, audio_index);
+        printf("[SPK] 播放控制: play=%d resume=%d pause=%d stop=%d vol=%d type=%d idx=%d\n",
+               play_flag, resume_flag, pause_flag, stop_flag, vol_req, play_type, audio_index);
 
         /* --- 音量（独立于播放控制，始终处理） --- */
         if (vol_req > 0) {
             set_volume(vol_req);
         }
 
-        /* 仅调节音量（无播放/暂停/停止动作），直接返回成功 */
-        if (vol_req > 0 && play_flag == 0 && pause_flag == 0 && stop_flag == 0) {
+        /* 仅调节音量（无播放/继续/暂停/停止动作），直接返回成功 */
+        if (vol_req > 0 && play_flag == 0 && resume_flag == 0 &&
+            pause_flag == 0 && stop_flag == 0) {
             if (resp) *resp = msg_build_cmd_response(ERR_SUCCESS, 301, "success");
             return 0;
         }
@@ -668,12 +742,15 @@ int device_speaker_execute(const cmd_t *cmd, cJSON **resp)
 
         /* --- 暂停 --- */
         if (pause_flag == 1) {
+            pthread_mutex_lock(&g_spk_mutex);
             if (!g_playing) {
+                pthread_mutex_unlock(&g_spk_mutex);
                 if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
                                                      "当前未在播放，无法暂停");
                 return -1;
             }
             if (g_paused) {
+                pthread_mutex_unlock(&g_spk_mutex);
                 if (resp) *resp = msg_build_cmd_response(ERR_SUCCESS, 301, "已处于暂停状态");
                 return 0;
             }
@@ -681,29 +758,40 @@ int device_speaker_execute(const cmd_t *cmd, cJSON **resp)
                 printf("[SPK] 暂停播放 (pid=%d)\n", g_player_pid);
                 kill(g_player_pid, SIGSTOP);
                 g_paused = 1;
-                notify_status_changed();
             }
+            pthread_mutex_unlock(&g_spk_mutex);
+            notify_status_changed();
             if (resp) *resp = msg_build_cmd_response(ERR_SUCCESS, 301, "success");
             return 0;
         }
 
-        /* --- 播放 --- */
-        if (play_flag == 1) {
-
-            /* 如果已暂停 → 恢复（SIGCONT） */
-            if (g_paused && g_player_pid > 0) {
-                printf("[SPK] 恢复播放 (pid=%d)\n", g_player_pid);
+        /* --- 继续播放（仅从暂停处恢复，不启动新任务） --- */
+        if (resume_flag == 1) {
+            pthread_mutex_lock(&g_spk_mutex);
+            if (!g_paused) {
+                pthread_mutex_unlock(&g_spk_mutex);
+                if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
+                                                     "当前无暂停任务，无法继续播放");
+                return -1;
+            }
+            if (g_player_pid > 0) {
+                printf("[SPK] 继续播放 (pid=%d)\n", g_player_pid);
                 kill(g_player_pid, SIGCONT);
                 g_paused = 0;
-                notify_status_changed();
-                if (resp) *resp = msg_build_cmd_response(ERR_SUCCESS, 301, "success");
-                return 0;
             }
+            pthread_mutex_unlock(&g_spk_mutex);
+            notify_status_changed();
+            if (resp) *resp = msg_build_cmd_response(ERR_SUCCESS, 301, "success");
+            return 0;
+        }
 
-            /* 验证 playType（离散枚举，必须为 1~4） */
-            if (play_type < 1 || play_type > 4) {
+        /* --- 播放（新任务，会顶替掉旧的暂停/播放任务） --- */
+        if (play_flag == 1) {
+
+            /* 验证 playType（离散枚举，必须为 1~5） */
+            if (play_type < 1 || play_type > 5) {
                 if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
-                                                     "playType 无效，必须为 1~4");
+                                                     "playType 无效，必须为 1~5");
                 return -1;
             }
 
@@ -818,8 +906,87 @@ int device_speaker_execute(const cmd_t *cmd, cJSON **resp)
                 break;
             }
 
+            case 5: {   /* ---- 插播：保存原任务 → 单次播插播 → 等待 → 恢复原任务 ---- */
+                if (audio_index < 0 || audio_index >= MAX_AUDIO_FILES ||
+                    !g_audio_list[audio_index].valid) {
+                    if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
+                                                         "audioIndex 无效");
+                    return -1;
+                }
+
+                pthread_mutex_lock(&g_spk_mutex);
+                if (g_insert_active) {
+                    pthread_mutex_unlock(&g_spk_mutex);
+                    if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
+                                                         "已有插播进行中，不支持嵌套插播");
+                    return -1;
+                }
+
+                int was_playing = (g_playing && g_thread_active);
+
+                if (!was_playing) {
+                    /* 无播放任务 → 退化为普通单次播放 */
+                    pthread_mutex_unlock(&g_spk_mutex);
+                    printf("[SPK] 插播: 当前无播放，作为单次播放\n");
+                    play_request_t r;
+                    memset(&r, 0, sizeof(r));
+                    r.play_type   = 4;
+                    r.audio_index = audio_index;
+                    if (start_playback(&r) != 0) {
+                        if (resp) *resp = msg_build_cmd_response(ERR_DEVICE_COMM, 301,
+                                                             "播放启动失败");
+                        return -1;
+                    }
+                    if (resp) *resp = msg_build_cmd_response(ERR_SUCCESS, 301, "success");
+                    return 0;
+                }
+
+                /*
+                 * 保存原任务 → 停止原播放 → 播放插播 → 等待插播结束 → 恢复原任务。
+                 * 全程使用已有的 join_play_thread/start_playback，不手动 kill，
+                 * 不跨线程共享 play_file_blocking，零竞态。
+                 */
+                play_request_t saved_req;
+                memcpy(&saved_req, &g_request, sizeof(play_request_t));
+
+                g_insert_active = 1;
+                pthread_mutex_unlock(&g_spk_mutex);
+
+                printf("[SPK] 插播: 保存原任务 (type=%d), 播放 audio=%d\n",
+                       saved_req.play_type, audio_index);
+
+                /* 1. 停止原播放（join_play_thread + killall 清理） */
+                join_play_thread();
+
+                /* 2. 启动插播（单次播放） */
+                {
+                    play_request_t ir;
+                    memset(&ir, 0, sizeof(ir));
+                    ir.play_type   = 4;
+                    ir.audio_index = audio_index;
+                    start_playback(&ir);
+                }
+
+                /* 3. 等待插播结束 */
+                while (g_thread_active) {
+                    usleep(100000);
+                }
+
+                /* 4. 恢复原播放 */
+                printf("[SPK] 插播结束，恢复原播放 (type=%d)\n", saved_req.play_type);
+                start_playback(&saved_req);
+
+                pthread_mutex_lock(&g_spk_mutex);
+                g_insert_active = 0;
+                pthread_mutex_unlock(&g_spk_mutex);
+
+                notify_status_changed();
+                if (resp) *resp = msg_build_cmd_response(ERR_SUCCESS, 301, "success");
+                return 0;
+            }
+
             default:
-                /* playType 已在上面校验为 1~4，不应到达此处 */
+                /* playType 已在上面校验为 1~5，不应到达此处 */
                 if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
                                                      "playType 无效");
                 return -1;
@@ -838,7 +1005,7 @@ int device_speaker_execute(const cmd_t *cmd, cJSON **resp)
 
         /* 无有效控制标志 */
         if (resp) *resp = msg_build_cmd_response(ERR_PARAM_INVALID, 301,
-                                             "缺少有效控制参数 (play/pause/stop/volume)");
+                                             "缺少有效控制参数 (play/resume/pause/stop/volume)");
         return -1;
     }
 

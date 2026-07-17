@@ -741,7 +741,7 @@ async def console_menu():
                     return None
                 return ai
 
-            print("  操作: 1=播放, 2=暂停, 3=停止")
+            print("  操作: 1=播放, 2=暂停, 3=继续播放, 4=停止")
             op = input("  操作 (默认1): ").strip() or "1"
 
             if op == "2":
@@ -753,11 +753,17 @@ async def console_menu():
             elif op == "3":
                 await send_cmd_to_client(ws, {
                     "cmd": 301, "token": token,
+                    "resume": 1, "volume": vol
+                })
+
+            elif op == "4":
+                await send_cmd_to_client(ws, {
+                    "cmd": 301, "token": token,
                     "stop": 1, "volume": vol
                 })
 
             else:
-                print("  播放模式: 1=循环, 2=顺序, 3=定时, 4=插播")
+                print("  播放模式: 1=循环, 2=顺序, 3=定时, 4=单次, 5=插播")
                 pt = int(input("  模式 (默认1): ").strip() or "1")
                 cmd_data = {
                     "cmd": 301, "token": token,
@@ -787,8 +793,15 @@ async def console_menu():
                         "  定时时间 (YYYY-MM-DD HH:mm:ss): "
                     ).strip() or now_str()
 
+                elif pt == 5:
+                    # 插播：暂停当前 → 播一首 → 恢复，只需 audioIndex
+                    ai = ask_audio_index()
+                    if ai is None:
+                        continue
+                    cmd_data["audioIndex"] = ai
+
                 else:
-                    # playType=1 循环, playType=4 插播/单次
+                    # playType=1 循环, playType=4 单次
                     ai = ask_audio_index()
                     if ai is None:
                         continue

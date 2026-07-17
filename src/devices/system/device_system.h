@@ -15,6 +15,18 @@ extern "C" {
 int device_system_execute(const cmd_t *cmd, cJSON **resp);
 
 /**
+ * @brief   与国家授时中心 NTP 对时
+ *
+ *          依次尝试 ntp.ntsc.ac.cn → cn.pool.ntp.org → ntp.aliyun.com，
+ *          任意一个成功即返回。ntpdate 未安装时回退到 timedatectl。
+ *
+ *          fork+exec 实现，多线程安全。
+ *
+ * @return  0 成功，-1 全部失败
+ */
+int device_system_ntp_sync(void);
+
+/**
  * @brief   三段式版本号比较
  * @param   a  版本号字符串，如 "1.0.1" 或 "2.0"
  * @param   b  版本号字符串，如 "1.1.0"

@@ -64,24 +64,87 @@ static int handle_sys_status(const cmd_t *cmd, cJSON **resp)
 }
 
 /* ======================================================================== */
-/*  cmd=602 校时服务                                                        */
+/*  NTP 时间同步（启动自动 + cmd=602 手动触发）                                 */
+/* ======================================================================== */
+
+/**
+ * @brief   与国家授时中心 NTP 对时
+ *
+ *          使用 fork+exec 执行 ntpdate，依次尝试三个 NTP 服务器，
+ *          任意一个成功即返回。ntpdate 未安装时回退到 timedatectl。
+ *
+ *          多线程安全：fork 后立即 exec，不继承锁状态。
+ *
+ * @return  0 成功，-1 全部失败
+ */
+int device_system_ntp_sync(void)
+{
+    static const char *ntp_servers[] = {
+        "ntp.ntsc.ac.cn",
+        "cn.pool.ntp.org",
+        "ntp.aliyun.com",
+    };
+    const int ntp_count = sizeof(ntp_servers) / sizeof(ntp_servers[0]);
+
+    printf("[SYS] NTP 对时开始...\n");
+
+    for (int i = 0; i < ntp_count; i++) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            fprintf(stderr, "[SYS] NTP fork 失败: %s\n", strerror(errno));
+            continue;
+        }
+
+        if (pid == 0) {
+            /* 子进程：执行 ntpdate -u <server> */
+            execlp("ntpdate", "ntpdate", "-u", ntp_servers[i], (char *)NULL);
+            _exit(127);
+        }
+
+        /* 父进程：阻塞等待 ntpdate 完成（默认 UDP 超时 ~5 秒） */
+        int status;
+        if (waitpid(pid, &status, 0) < 0) {
+            fprintf(stderr, "[SYS] NTP waitpid 失败: %s\n", strerror(errno));
+            continue;
+        }
+
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            printf("[SYS] NTP 对时成功: %s\n", ntp_servers[i]);
+            return 0;
+        }
+
+        printf("[SYS] NTP %s 失败 (exit=%d), 尝试下一个...\n",
+               ntp_servers[i], WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    }
+
+    /* ntpdate 全部失败或未安装，回退到 timedatectl */
+    fprintf(stderr, "[SYS] ntpdate 全部失败，回退 timedatectl...\n");
+    int ret = system("timedatectl set-ntp true 2>/dev/null");
+    if (ret == 0) {
+        printf("[SYS] systemd-timesyncd 已启用（后台自动同步）\n");
+        return 0;
+    }
+
+    fprintf(stderr, "[SYS] NTP 对时全部失败\n");
+    return -1;
+}
+
+/* ======================================================================== */
+/*  cmd=602 校时服务（手动触发 NTP 对时）                                      */
 /* ======================================================================== */
 
 static int handle_sys_time(const cmd_t *cmd, cJSON **resp)
 {
-    const char *server_times = cmd_get_string(cmd, "serverTimes");
-    printf("[SYS] 校时服务: serverTimes=%s\n",
-           server_times ? server_times : "(null)");
+    (void)cmd;  /* serverTimes 字段仅供参考，直接走 NTP */
+    printf("[SYS] 校时服务: 手动触发 NTP 对时\n");
 
-    if (!server_times || server_times[0] == '\0') {
-        fprintf(stderr, "[SYS] 缺少 serverTimes 参数\n");
-        *resp = msg_build_cmd_response(ERR_UNKNOWN_CMD, 602, "缺少 serverTimes 参数");
-        return -1;
+    int ret = device_system_ntp_sync();
+    if (ret == 0) {
+        *resp = msg_build_cmd_response(0, 602, "NTP sync success");
+    } else {
+        *resp = msg_build_cmd_response(ERR_DEVICE_COMM, 602, "NTP sync failed");
     }
-
-    printf("[SYS] 已记录服务器时间\n");
-    *resp = msg_build_cmd_response(0, 602, "success");
-    return 0;
+    return ret;
 }
 
 /* ======================================================================== */

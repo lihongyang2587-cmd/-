@@ -699,6 +699,9 @@ int main(void)
         return EXIT_FAILURE;
     }
 
+    /* 7.5 与国家授时中心 NTP 对时（认证成功说明网络通，此时仅主线程，fork 安全） */
+    device_system_ntp_sync();
+
     /* 8. 初始化 send_queue 和 worker 线程 */
     if (init_all_workers() != 0) {
         printf("[MAIN] Worker 线程初始化失败\n");
