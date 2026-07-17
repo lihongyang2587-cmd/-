@@ -1265,8 +1265,11 @@ cJSON *device_ptz_get_status(void)
         fail        = g_fail_status;
     }
 
+    /* 硬件存活检测：串口设备节点不存在则判定离线 */
+    bool hw_ok = (access(PTZ_UART_DEV, F_OK) == 0);
+
     cJSON *status = cJSON_CreateObject();
-    cJSON_AddBoolToObject(status, "online", (fail != 1));
+    cJSON_AddBoolToObject(status, "online", (hw_ok && fail == 0));
 
     /*
      * 根据运行模式设置 state 字段：

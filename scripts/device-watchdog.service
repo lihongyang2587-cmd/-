@@ -1,0 +1,27 @@
+[Unit]
+Description=Device App Watchdog — 边检机器人控制板看门狗
+Documentation=https://github.com/your-org/your-repo
+After=network.target local-fs.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/device_watchdog.sh
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=always
+RestartSec=5
+
+# 安全加固（可选，按需调整）
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/tmp /var/log /root/src
+PrivateTmp=false
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=device-watchdog
+
+[Install]
+WantedBy=multi-user.target

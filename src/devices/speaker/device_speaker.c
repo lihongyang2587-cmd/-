@@ -1170,8 +1170,11 @@ cJSON *device_speaker_get_status(void)
         fs  = g_fail_status;
     }
 
+    /* 硬件存活检测：USB 声卡不存在则判定离线 */
+    bool hw_ok = (g_alsa_card >= 0);
+
     cJSON *status = cJSON_CreateObject();
-    cJSON_AddBoolToObject  (status, "online",     (fs == 0));
+    cJSON_AddBoolToObject  (status, "online",     (hw_ok && fs == 0));
     cJSON_AddNumberToObject(status, "volume",     vol);
     cJSON_AddNumberToObject(status, "audioIndex", idx >= 0 ? idx : 0);
     cJSON_AddNumberToObject(status, "playType",   pt);

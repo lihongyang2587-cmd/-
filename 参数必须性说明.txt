@@ -1,0 +1,94 @@
+================================================================================
+  四外设服务器参数必须性说明
+================================================================================
+
+## 云台 PTZ
+
+### cmd=101 移动控制
+  dir       必填    0=绝对定位 1=左 2=右 3=上 4=下，非 0~4 → 报错
+  speed     可选    默认 5，范围 0~10，超出钳位
+  angle     可选    默认 0。dir=0 时=绝对目标角度(必填>0)；dir≠0 时=相对偏移量(>0 执行相对定位，≤0 持续转动)
+  axis      可选    默认 1，仅 dir=0 时生效。1=水平绝对定位 2=垂直绝对定位
+  stop      可选    默认 0，1=无条件停止退出扫描
+
+### cmd=102 绝对角度归位
+  horizontalAngle   必填    不传 → 报错，范围 [0,350] 超出钳位
+  verticalAngle     必填    不传 → 报错，范围 [-32,23] 超出钳位
+
+### cmd=103 预置位设置
+  groupNum          必填    1 或 2，无效 → 报错
+  groupData         必填    JSON 数组 1~16 个点，缺失/空 → 报错
+    [].index        必填    0~15
+    [].horAngle     必填    超出钳位
+    [].verAngle     必填    超出钳位
+
+### cmd=104 巡航
+  groupNum          必填    1 或 2，无效或该组无预置位 → 报错
+  dwell             必填    0=5s 1=10s 2=15s，非 0~2 → 报错
+  speed             可选    默认 5，超出钳位
+
+### cmd=105 扫描
+  scanDir           必填    1=水平（仅支持水平扫描），非 1 → 报错
+  speed             可选    默认 5，超出钳位
+
+### cmd=106 预置位查询
+  groupNum          必填    1 或 2，无效 → 报错（无数据不报错仅返空数组）
+
+
+## LED 字幕屏
+
+### cmd=201 字幕播放
+  textData          必填    JSON 数组至少 1 条，空/缺失 → 报错
+  lightVal          可选    不传 = 沿用上次亮度，范围 [30,100] 超出钳位
+  showType          可选    默认 0，0=静态 2=轮换
+  switchTime        可选    默认 5 秒，仅 showType=2 生效
+  displayStyle      可选    默认 0，0=静止/轮换 1=左右滚动 2=上下滚动
+
+### cmd=202 开关控制
+  switch            必填    0=关 1=开，传其他 → 报错
+
+
+## 音箱 Speaker
+
+### cmd=301 播放控制
+  play              条件    启动播放 =1；play/pause/stop/volume 全无 → 报错
+  pause             可选    默认 0，=1 暂停（未播放时暂停 → 报错）
+  stop              可选    默认 0，=1 停止
+  volume            可选    默认 0，>0 时设置，=0 忽略
+  playType          play=1 时必填    1=循环 2=顺序 3=定时 4=单次，非 1~4 → 报错
+  audioIndex        playType=1/3/4 时必填    指向已下载音频，无效 → 报错
+  playData          playType=2/3 时必填    2→audioIndex 数组，3→时间字符串
+
+### cmd=302 设置音频列表
+  downUrl           必填    缺失 → 报错
+  audioData         必填    JSON 数组，缺失 → 报错
+
+### cmd=303 获取音频列表
+  无参数
+
+
+## 警灯 Alarm
+
+### cmd=401 警灯控制
+  state             必填    0=关 1=开，非 0/1 → 报错
+  lightType         必填    0~14（15 种模式），超范围 → 报错
+  openType          必填    0=立即 1=定时，非 0/1 → 报错
+  openData          openType=1 时必填    时间字符串，缺失 → 报错
+
+
+================================================================================
+  必填参数速查（缺失即报错）
+================================================================================
+
+PTZ-101   dir；dir=0 时 angle 必填(>0)
+PTZ-102   horizontalAngle, verticalAngle
+PTZ-103   groupNum, groupData
+PTZ-104   groupNum, dwell
+PTZ-105   scanDir（仅支持 1=水平）
+PTZ-106   groupNum
+LED-201   textData
+LED-202   switch
+SPK-301   play|pause|stop|volume 至少一个；play=1 时 playType；type=1/3/4 时 audioIndex；type=2/3 时 playData
+SPK-302   downUrl, audioData
+SPK-303   (无)
+ALM-401   state, lightType, openType；openType=1 时 openData

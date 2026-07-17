@@ -504,25 +504,25 @@ cJSON *device_led_get_status(void)
      */
     std::string txt;
     int lv, st, ds;
-    bool onl;
 
     if (pthread_mutex_trylock(&g_led_mutex) == 0) {
         txt = g_cur_text;
         lv  = g_cur_light_val;
         st  = g_cur_show_type;
         ds  = g_cur_display_style;
-        onl = g_online;
         pthread_mutex_unlock(&g_led_mutex);
     } else {
         txt = g_cur_text;
         lv  = g_cur_light_val;
         st  = g_cur_show_type;
         ds  = g_cur_display_style;
-        onl = g_online;
     }
 
+    /* 硬件存活检测：串口设备节点不存在则判定离线 */
+    bool hw_ok = (access(LED_UART_DEV, F_OK) == 0);
+
     cJSON *status = cJSON_CreateObject();
-    cJSON_AddBoolToObject  (status, "online",  onl);
+    cJSON_AddBoolToObject  (status, "online",  (hw_ok && g_fail_status == 0));
 
     /* textData 数组 */
     cJSON *arr = cJSON_CreateArray();

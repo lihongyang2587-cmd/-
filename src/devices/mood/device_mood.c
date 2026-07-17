@@ -128,7 +128,7 @@ cJSON *device_mood_get_status(void)
     cJSON_AddStringToObject(status, "device", "mood");
     cJSON_AddStringToObject(status, "state",  state);
     cJSON_AddStringToObject(status, "type",   type);
-    cJSON_AddBoolToObject  (status, "online", true);
+    cJSON_AddBoolToObject  (status, "online", false);
 
     return status;
 }

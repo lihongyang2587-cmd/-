@@ -620,22 +620,12 @@ int main(void)
     printf("[MAIN] 当前运行版本: %s\n", config_manager_get_fw_version());
 
     /*
-     * 2.5 启动看门狗守护进程
+     * 2.5 写入 PID 文件供独立看门狗守护进程监控
      *
-     * 看门狗独立于主进程运行（fork + 双 setsid），每 30 秒检测主进程存活状态。
-     * 若主进程死亡，检查 upgrade_pending.json 决定是否替换二进制后重启。
-     *
-     * 检查 DEVICE_WATCHDOG_ACTIVE 环境变量：若已设置（由看门狗重启时设置），
-     * 跳过 fork 新看门狗，避免链条式累积。
-     *
-     * PID 文件必须先于看门狗写入，确保看门狗启动后能立即读取到有效的 PID。
+     * 看门狗已独立部署（systemd + device_watchdog.sh），不再从 device_app
+     * 内部 fork。仅需写入 PID 到 /tmp/device_app.pid 供外部看门狗检测。
      */
     watchdog_write_pid();
-    if (getenv("DEVICE_WATCHDOG_ACTIVE") == NULL) {
-        watchdog_daemon_start();
-    } else {
-        printf("[MAIN] 由看门狗重启启动，跳过看门狗 fork\n");
-    }
 
     /* 3. 将配置文件中保存的状态恢复到各设备模块的内存中
      *    必须在 sync 之前执行，否则 sync 会用默认值覆盖文件 */

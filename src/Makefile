@@ -51,7 +51,7 @@ LDFLAGS := -lpthread -lasound -lm -ldl $(LED_LIBS)
 # ============================================================
 #  默认目标
 # ============================================================
-.PHONY: all clean
+.PHONY: all clean install-watchdog
 
 all: $(TARGET)
 	@echo "========================================="
@@ -76,5 +76,25 @@ network/mongoose.o: network/mongoose.c
 clean:
 	rm -f $(OBJS) $(DEPS) $(TARGET)
 	@echo "已清理编译产物"
+
+# ============================================================
+#  部署独立看门狗（需 sudo 权限）
+# ============================================================
+install-watchdog:
+	@echo "安装独立看门狗..."
+	@if [ ! -f ../scripts/device_watchdog.sh ]; then \
+		echo "错误: 找不到 ../scripts/device_watchdog.sh"; \
+		exit 1; \
+	fi
+	@if [ ! -f ../scripts/device-watchdog.service ]; then \
+		echo "错误: 找不到 ../scripts/device-watchdog.service"; \
+		exit 1; \
+	fi
+	cp ../scripts/device_watchdog.sh /usr/local/bin/device_watchdog.sh
+	chmod +x /usr/local/bin/device_watchdog.sh
+	cp ../scripts/device-watchdog.service /etc/systemd/system/device-watchdog.service
+	systemctl daemon-reload
+	systemctl enable --now device-watchdog
+	@echo "看门狗安装完成: systemctl status device-watchdog"
 
 -include $(DEPS)

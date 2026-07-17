@@ -459,6 +459,7 @@ int device_alarm_execute(const cmd_t *cmd, cJSON **resp)
                                                      "定时任务启动失败");
                 return -1;
             }
+            g_fail_status = 0;  /* 定时任务启动成功，恢复正常 */
             if (resp) *resp = msg_build_response(ERR_SUCCESS, "success");
             return 0;
         }
@@ -505,8 +506,11 @@ cJSON *device_alarm_get_status(void)
         fs   = g_fail_status;
     }
 
+    /* 硬件存活检测：GPIO 路径不可写则判定离线 */
+    bool hw_ok = (access(GPIO_VALUE_PATH, W_OK) == 0);
+
     cJSON *status = cJSON_CreateObject();
-    cJSON_AddBoolToObject  (status, "online",    (fs == 0));
+    cJSON_AddBoolToObject  (status, "online",    (hw_ok && fs == 0));
     cJSON_AddNumberToObject(status, "state",     on);
     cJSON_AddNumberToObject(status, "lightType", mode);
 

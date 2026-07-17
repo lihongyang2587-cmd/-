@@ -38,17 +38,15 @@ int device_system_ntp_sync(void);
 int compare_versions(const char *a, const char *b);
 
 /**
- * @brief   启动看门狗守护进程（fork + setsid，脱离终端独立运行）
+ * @brief   [已废弃] 启动看门狗守护进程
  *
- *          看门狗每 WATCHDOG_CHECK_INTERVAL 秒检测 /tmp/device_app.pid
- *          中的主进程是否存活。若主进程死亡：
- *          - 存在 upgrade_pending.json 且 newBin 文件有效 → 替换二进制 → 启动新固件
- *          - 否则 → 直接启动现有固件
+ *          V3.2 起看门狗已迁移为独立 systemd 服务（scripts/device_watchdog.sh），
+ *          不再从 device_app 内部 fork。此函数保留仅为编译兼容，不再被调用。
  *
- *          重启主进程时设置环境变量 DEVICE_WATCHDOG_ACTIVE=1，
- *          防止 main.c 重复 fork 看门狗。
- *
- *          应在主进程完成基本初始化后调用（确保 /tmp/device_app.pid 已写入）。
+ *          新看门狗部署方式：
+ *            sudo cp scripts/device_watchdog.sh /usr/local/bin/
+ *            sudo cp scripts/device-watchdog.service /etc/systemd/system/
+ *            sudo systemctl enable --now device-watchdog
  */
 void watchdog_daemon_start(void);
 

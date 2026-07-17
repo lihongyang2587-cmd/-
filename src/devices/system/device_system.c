@@ -343,18 +343,13 @@ void watchdog_write_pid(void)
 }
 
 /**
- * @brief   启动看门狗守护进程（fork + setsid，脱离终端独立运行）
+ * @brief   [已废弃] 启动看门狗守护进程
  *
- *          主循环每 WATCHDOG_CHECK_INTERVAL 秒检测主进程是否存活。
- *          若主进程死亡：
- *          - 存在 upgrade_pending.json 且 newBin 有效 → 替换二进制 → 启动新固件
- *          - 否则 → 直接启动现有固件
+ *          V3.2 起看门狗已迁移为独立 systemd 服务（scripts/device_watchdog.sh），
+ *          不再从 device_app 内部 fork。此函数保留仅为编译兼容，不再被调用。
  *
- *          重启时设置 DEVICE_WATCHDOG_ACTIVE=1 防止 main.c 重复 fork。
- *
- *          使用双 fork 策略彻底脱离终端：
- *          fork₁ → 父进程返回，子进程 setsid() → fork₂ → 孙进程执行循环
- *          （孙进程不再是会话首进程，永远不会获得控制终端）
+ *          原实现：双 fork + setsid 脱离终端，每 30s 检测主进程存活并在死亡时
+ *          检查 upgrade_pending.json 替换二进制后重启。
  */
 void watchdog_daemon_start(void)
 {
